@@ -39,6 +39,9 @@ class DeviceReader:
         self.notify_future: asyncio.Future[Any] | None = None
         self.current_command = None
         self.notify_response = bytearray()
+        # Buffer for accumulating encrypted notifications until a full frame is received
+        self._enc_buffer = bytearray()
+        self._enc_expected_len: int | None = None
 
         # polling mutex to guard against switches
         self.polling_lock = asyncio.Lock()
@@ -170,6 +173,9 @@ class DeviceReader:
                             pass
                         self.has_notifier = False
                     await self.client.disconnect()
+                # Always clear any partial encrypted buffers between polling cycles
+                self._enc_buffer.clear()
+                self._enc_expected_len = None
 
             # Check if dict is empty
             if not parsed_data:
@@ -228,41 +234,110 @@ class DeviceReader:
 
         # Handle encrypted data
         if self.encrypted is True:
-            message = Message(data)
+            # First check if this is a pre-key-exchange control message (starts with magic "**")
+            try:
+                message = Message(data)
+            except Exception:
+                message = None  # Will be treated as encrypted payload below
 
-            # Handle key exchange
-            if message.is_pre_key_exchange:
-                message.verify_checksum()
+            if message is not None and message.is_pre_key_exchange:
+                try:
+                    message.verify_checksum()
 
-                if message.type == MessageType.CHALLENGE:
-                    challenge_response = self.encryption.msg_challenge(message)
-                    await self.client.write_gatt_char(WRITE_UUID, challenge_response)
+                    if message.type == MessageType.CHALLENGE:
+                        challenge_response = self.encryption.msg_challenge(message)
+                        if challenge_response is not None:
+                            await self.client.write_gatt_char(WRITE_UUID, challenge_response)
+                        return
+
+                    if message.type == MessageType.CHALLENGE_ACCEPTED:
+                        _LOGGER.debug("Challenge accepted")
+                        return
+                except Exception as err:
+                    _LOGGER.warning("Error handling pre-key message: %s", err)
                     return
 
-                if message.type == MessageType.CHALLENGE_ACCEPTED:
-                    _LOGGER.debug("Challenge accepted")
+            # From here on, treat data as part of an encrypted frame. Accumulate until complete.
+            self._enc_buffer.extend(data)
+
+            # Determine expected encrypted frame length once we have enough header bytes
+            if self._enc_expected_len is None:
+                # We need at least 2 bytes for plaintext length. In secure phase we also need 4 bytes IV seed.
+                need = 6 if self.encryption.secure_aes_key is not None else 2
+                if len(self._enc_buffer) < need:
                     return
 
-            if self.encryption.unsecure_aes_key is None:
-                _LOGGER.error("Received encrypted message before key initialization")
+                # Parse the plaintext length from the first 2 bytes
+                plain_len = (self._enc_buffer[0] << 8) + self._enc_buffer[1]
+                padding = (16 - (plain_len % 16)) % 16
+                iv_overhead = 4 if self.encryption.secure_aes_key is not None else 0
+                self._enc_expected_len = 2 + iv_overhead + plain_len + padding
 
-            key, iv = self.encryption.getKeyIv()
-            decrypted = Message(self.encryption.aes_decrypt(message.buffer, key, iv))
+            # Wait for the full encrypted frame
+            if len(self._enc_buffer) < self._enc_expected_len:
+                return
 
-            if decrypted.is_pre_key_exchange:
-                decrypted.verify_checksum()
+            if len(self._enc_buffer) > self._enc_expected_len:
+                _LOGGER.warning(
+                    "Encrypted frame larger than expected: got %s, expected %s. Dropping.",
+                    len(self._enc_buffer),
+                    self._enc_expected_len,
+                )
+                # Reset buffer and try to resync on next message
+                self._enc_buffer.clear()
+                self._enc_expected_len = None
+                return
 
-                if decrypted.type == MessageType.PEER_PUBKEY:
-                    peer_pubkey_response = self.encryption.msg_peer_pubkey(decrypted)
-                    await self.client.write_gatt_char(WRITE_UUID, peer_pubkey_response)
+            # We have exactly one full encrypted frame
+            enc_frame = bytes(self._enc_buffer)
+            self._enc_buffer.clear()
+            self._enc_expected_len = None
+
+            try:
+                key, iv = self.encryption.getKeyIv()
+                decrypted_bytes = self.encryption.aes_decrypt(enc_frame, key, iv)
+            except ValueError as err:
+                # Commonly happens when receiving a partial or stray notification; ignore gracefully
+                _LOGGER.debug("Failed to decrypt frame (%s). Ignoring.", err)
+                return
+            except Exception as err:
+                _LOGGER.warning("Decrypt error: %s", err)
+                return
+
+            # Decrypted bytes may either be another key-exchange message or a regular payload
+            try:
+                decrypted = Message(decrypted_bytes)
+            except Exception:
+                decrypted = None
+
+            if decrypted is not None and decrypted.is_pre_key_exchange:
+                try:
+                    decrypted.verify_checksum()
+
+                    if decrypted.type == MessageType.PEER_PUBKEY:
+                        try:
+                            peer_pubkey_response = self.encryption.msg_peer_pubkey(decrypted)
+                        except Exception as err:
+                            _LOGGER.warning("Peer pubkey handling failed: %s", err)
+                            # Reset encryption to force a fresh handshake
+                            self.encryption.reset()
+                            return
+                        await self.client.write_gatt_char(WRITE_UUID, peer_pubkey_response)
+                        return
+
+                    if decrypted.type == MessageType.PUBKEY_ACCEPTED:
+                        try:
+                            self.encryption.msg_key_accepted(decrypted)
+                        except Exception as err:
+                            _LOGGER.warning("Key acceptance failed: %s", err)
+                            self.encryption.reset()
+                        return
+                except Exception as err:
+                    _LOGGER.warning("Error handling decrypted pre-key message: %s", err)
                     return
 
-                if decrypted.type == MessageType.PUBKEY_ACCEPTED:
-                    self.encryption.msg_key_accepted(decrypted)
-                    return
-
-            # Handle as message
-            data = decrypted.buffer
+            # Treat decrypted bytes as the actual payload going forward
+            data = decrypted_bytes
 
         # Ignore notifications we don't expect
         if self.notify_future is None or self.notify_future.done():
