@@ -257,88 +257,88 @@ class DeviceReader:
                     _LOGGER.warning("Error handling pre-key message: %s", err)
                     return
 
-            # From here on, treat data as part of an encrypted frame. Accumulate until complete.
+            # From here on, treat data as part of one or more encrypted frames.
+            # Accumulate, then parse and process as many complete frames as present.
             self._enc_buffer.extend(data)
 
-            # Determine expected encrypted frame length once we have enough header bytes
-            if self._enc_expected_len is None:
-                # We need at least 2 bytes for plaintext length. In secure phase we also need 4 bytes IV seed.
-                need = 6 if self.encryption.secure_aes_key is not None else 2
-                if len(self._enc_buffer) < need:
+            while True:
+                # Determine expected encrypted frame length once we have enough header bytes
+                if self._enc_expected_len is None:
+                    # We need at least 2 bytes for plaintext length. In secure phase we also need 4 bytes IV seed.
+                    need = 6 if self.encryption.secure_aes_key is not None else 2
+                    if len(self._enc_buffer) < need:
+                        return
+
+                    # Parse the plaintext length from the first 2 bytes
+                    plain_len = (self._enc_buffer[0] << 8) + self._enc_buffer[1]
+                    padding = (16 - (plain_len % 16)) % 16
+                    iv_overhead = 4 if self.encryption.secure_aes_key is not None else 0
+                    self._enc_expected_len = 2 + iv_overhead + plain_len + padding
+
+                if len(self._enc_buffer) < self._enc_expected_len:
+                    # Not enough bytes yet for a full frame
                     return
 
-                # Parse the plaintext length from the first 2 bytes
-                plain_len = (self._enc_buffer[0] << 8) + self._enc_buffer[1]
-                padding = (16 - (plain_len % 16)) % 16
-                iv_overhead = 4 if self.encryption.secure_aes_key is not None else 0
-                self._enc_expected_len = 2 + iv_overhead + plain_len + padding
-
-            # Wait for the full encrypted frame
-            if len(self._enc_buffer) < self._enc_expected_len:
-                return
-
-            if len(self._enc_buffer) > self._enc_expected_len:
-                _LOGGER.warning(
-                    "Encrypted frame larger than expected: got %s, expected %s. Dropping.",
-                    len(self._enc_buffer),
-                    self._enc_expected_len,
-                )
-                # Reset buffer and try to resync on next message
-                self._enc_buffer.clear()
+                # We have at least one complete frame; if more bytes exist, keep them for the next loop
+                enc_frame = bytes(self._enc_buffer[: self._enc_expected_len])
+                # Trim used bytes from buffer and reset expected len to recalc for any following frame
+                del self._enc_buffer[: self._enc_expected_len]
                 self._enc_expected_len = None
-                return
 
-            # We have exactly one full encrypted frame
-            enc_frame = bytes(self._enc_buffer)
-            self._enc_buffer.clear()
-            self._enc_expected_len = None
-
-            try:
-                key, iv = self.encryption.getKeyIv()
-                decrypted_bytes = self.encryption.aes_decrypt(enc_frame, key, iv)
-            except ValueError as err:
-                # Commonly happens when receiving a partial or stray notification; ignore gracefully
-                _LOGGER.debug("Failed to decrypt frame (%s). Ignoring.", err)
-                return
-            except Exception as err:
-                _LOGGER.warning("Decrypt error: %s", err)
-                return
-
-            # Decrypted bytes may either be another key-exchange message or a regular payload
-            try:
-                decrypted = Message(decrypted_bytes)
-            except Exception:
-                decrypted = None
-
-            if decrypted is not None and decrypted.is_pre_key_exchange:
                 try:
-                    decrypted.verify_checksum()
-
-                    if decrypted.type == MessageType.PEER_PUBKEY:
-                        try:
-                            peer_pubkey_response = self.encryption.msg_peer_pubkey(decrypted)
-                        except Exception as err:
-                            _LOGGER.warning("Peer pubkey handling failed: %s", err)
-                            # Reset encryption to force a fresh handshake
-                            self.encryption.reset()
-                            return
-                        await self.client.write_gatt_char(WRITE_UUID, peer_pubkey_response)
-                        return
-
-                    if decrypted.type == MessageType.PUBKEY_ACCEPTED:
-                        try:
-                            self.encryption.msg_key_accepted(decrypted)
-                        except Exception as err:
-                            _LOGGER.warning("Key acceptance failed: %s", err)
-                            self.encryption.reset()
-                        return
+                    key, iv = self.encryption.getKeyIv()
+                    decrypted_bytes = self.encryption.aes_decrypt(enc_frame, key, iv)
+                except ValueError as err:
+                    # Commonly happens when receiving a partial or stray notification; ignore gracefully
+                    _LOGGER.debug("Failed to decrypt frame (%s). Ignoring.", err)
+                    continue
                 except Exception as err:
-                    _LOGGER.warning("Error handling decrypted pre-key message: %s", err)
-                    return
+                    _LOGGER.warning("Decrypt error: %s", err)
+                    continue
 
-            # Treat decrypted bytes as the actual payload going forward
-            data = decrypted_bytes
+                # Decrypted bytes may either be another key-exchange message or a regular payload
+                try:
+                    decrypted = Message(decrypted_bytes)
+                except Exception:
+                    decrypted = None
 
+                if decrypted is not None and decrypted.is_pre_key_exchange:
+                    try:
+                        decrypted.verify_checksum()
+
+                        if decrypted.type == MessageType.PEER_PUBKEY:
+                            try:
+                                peer_pubkey_response = self.encryption.msg_peer_pubkey(decrypted)
+                            except Exception as err:
+                                _LOGGER.warning("Peer pubkey handling failed: %s", err)
+                                # Reset encryption to force a fresh handshake
+                                self.encryption.reset()
+                                continue
+                            await self.client.write_gatt_char(WRITE_UUID, peer_pubkey_response)
+                            continue
+
+                        if decrypted.type == MessageType.PUBKEY_ACCEPTED:
+                            try:
+                                self.encryption.msg_key_accepted(decrypted)
+                            except Exception as err:
+                                _LOGGER.warning("Key acceptance failed: %s", err)
+                                self.encryption.reset()
+                            continue
+                    except Exception as err:
+                        _LOGGER.warning("Error handling decrypted pre-key message: %s", err)
+                        continue
+
+                # Treat decrypted bytes as the actual payload and feed into plain handler logic
+                await self._handle_plain_data(decrypted_bytes)
+
+            # Nothing else to do here; the plain handler above dealt with the data
+            return
+
+        # Non-encrypted path: handle as plain data
+        await self._handle_plain_data(data)
+
+    async def _handle_plain_data(self, data: bytes | bytearray):
+        """Handle plaintext payload bytes by accumulating and fulfilling the notify future."""
         # Ignore notifications we don't expect
         if self.notify_future is None or self.notify_future.done():
             _LOGGER.warning("Unexpected notification")
@@ -353,6 +353,7 @@ class DeviceReader:
         # Save data
         self.notify_response.extend(data)
 
+        # Check for completion or exception
         if len(self.notify_response) == self.current_command.response_size():
             if self.current_command.is_valid_response(self.notify_response):
                 self.notify_future.set_result(self.notify_response)
