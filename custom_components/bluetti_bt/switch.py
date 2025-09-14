@@ -7,7 +7,7 @@ import logging
 import async_timeout
 
 from bleak import BleakError
-
+from bleak_retry_connector import establish_connection
 from homeassistant.components import bluetooth
 from homeassistant.components.switch import SwitchEntity, SwitchDeviceClass
 from homeassistant.config_entries import ConfigEntry
@@ -25,7 +25,7 @@ from homeassistant.helpers.update_coordinator import (
 
 from .bluetti_bt_lib.base_devices.BluettiDevice import BluettiDevice
 from .bluetti_bt_lib.const import WRITE_UUID
-from .bluetti_bt_lib.field_attributes import FIELD_ATTRIBUTES, PACK_FIELD_ATTRIBUTES, FieldType
+from .bluetti_bt_lib.field_attributes import FIELD_ATTRIBUTES, FieldType
 from .bluetti_bt_lib.utils.device_builder import build_device
 
 from . import device_info as dev_info, get_unique_id
@@ -93,7 +93,6 @@ class BluettiSwitch(CoordinatorEntity, SwitchEntity):
 
         self._bluetti_device = bluetti_device
         self._coordinator = coordinator
-        self._client = coordinator.reader.client
         self._polling_lock = coordinator.reader.polling_lock
         e_name = f"{device_info.get('name')} {name}"
         self._address = address
@@ -166,14 +165,24 @@ class BluettiSwitch(CoordinatorEntity, SwitchEntity):
         async with self._polling_lock:
             try:
                 async with async_timeout.timeout(15):
-                    if not self._client.is_connected:
-                        await self._client.connect()
+                    client = self._coordinator.reader.client
+                    if not client.is_connected:
+                        client = await establish_connection(
+                            client.__class__,
+                            self._address,
+                            self._bluetti_device.type,
+                            ble_device_callback=lambda: bluetooth.async_ble_device_from_address(
+                                self._coordinator.hass, self._address
+                            ),
+                            max_attempts=self._coordinator.reader.max_retries,
+                        )
+                        self._coordinator.reader.client = client
 
                     # Send command
-                    _LOGGER.debug("Requesting %s (%s,%s)", command, self._response_key, state)
-                    await self._client.write_gatt_char(
-                        WRITE_UUID, bytes(command)
+                    _LOGGER.debug(
+                        "Requesting %s (%s,%s)", command, self._response_key, state
                     )
+                    await client.write_gatt_char(WRITE_UUID, bytes(command))
 
                     # Wait until device has changed value, otherwise reading register might reset it
                     await asyncio.sleep(5)
@@ -185,8 +194,8 @@ class BluettiSwitch(CoordinatorEntity, SwitchEntity):
                 _LOGGER.error("Bleak error: %s", err)
                 return None
             finally:
-                # Disconnect if connection not persistant
+                # Disconnect if connection not persistent
                 if not self._coordinator.reader.persistent_conn:
-                    await self._client.disconnect()
+                    await client.disconnect()
 
         await self.coordinator.async_request_refresh()

@@ -49,9 +49,13 @@ class PollingCoordinator(DataUpdateCoordinator):
         self.logger.debug("Creating client")
         device = bluetooth.async_ble_device_from_address(hass, address)
         if device is None:
-            self.logger.error("Device %s not available", mac_loggable(address))
-            return None
-        client = BleakClient(device)
+            self.logger.warning(
+                "Device %s not available at startup; waiting for advertisement",
+                mac_loggable(address),
+            )
+            client = BleakClient(address)
+        else:
+            client = BleakClient(device)
         bluetti_device = build_device(address, device_name)
 
         self.reader = DeviceReader(
@@ -62,6 +66,9 @@ class PollingCoordinator(DataUpdateCoordinator):
             polling_timeout=polling_timeout,
             max_retries=max_retries,
             encrypted=encrypted,
+            ble_device_callback=lambda: bluetooth.async_ble_device_from_address(
+                hass, address
+            ),
         )
 
     async def _async_update_data(self):
@@ -70,11 +77,5 @@ class PollingCoordinator(DataUpdateCoordinator):
         This is the place to pre-process the data to lookup tables
         so entities can quickly look up their data.
         """
-
-        # Check if device is connected
-        if bluetooth.async_address_present(self.hass, self.address, connectable=True) is False:
-            self.logger.warning("Device not connected")
-            self.last_update_success = False
-            return None
 
         return await self.reader.read_data()

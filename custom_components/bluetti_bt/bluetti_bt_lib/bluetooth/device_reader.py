@@ -5,6 +5,8 @@ import logging
 from typing import Any, Callable, List, cast
 import async_timeout
 from bleak import BleakClient, BleakError
+from bleak.backends.device import BLEDevice
+from bleak_retry_connector import establish_connection
 
 from custom_components.bluetti_bt.bluetti_bt_lib.bluetooth.encryption import BluettiEncryption, Message, MessageType
 
@@ -26,6 +28,7 @@ class DeviceReader:
         polling_timeout: int = 45,
         max_retries: int = 5,
         encrypted: bool = False,
+        ble_device_callback: Callable[[], BLEDevice] | None = None,
     ) -> None:
         self.client = bleak_client
         self.bluetti_device = bluetti_device
@@ -34,6 +37,7 @@ class DeviceReader:
         self.polling_timeout = polling_timeout
         self.max_retries = max_retries
         self.encrypted = encrypted
+        self._ble_device_cb = ble_device_callback
 
         self.has_notifier = False
         self.notify_future: asyncio.Future[Any] | None = None
@@ -70,20 +74,18 @@ class DeviceReader:
         async with self.polling_lock:
             try:
                 async with async_timeout.timeout(self.polling_timeout):
-                    # Reconnect if not connected
-                    for attempt in range(1, self.max_retries + 1):
-                        try:
-                            if not self.client.is_connected:
-                                await self.client.connect()
-                            break
-                        except Exception as e:
-                            if attempt == self.max_retries:
-                                raise e # pass exception on max_retries attempt
-                            else:
-                                _LOGGER.warning(
-                                    f"Connect unsucessful (attempt {attempt}): {e}. Retrying..."
-                                )
-                                await asyncio.sleep(2)
+                    # Reconnect if not connected using bleak_retry_connector
+                    if not self.client.is_connected:
+                        ble_device = self._ble_device_cb() if self._ble_device_cb else None
+                        if ble_device is None:
+                            ble_device = self.client.address
+                        self.client = await establish_connection(
+                            self.client.__class__,
+                            ble_device,
+                            self.bluetti_device.type,
+                            ble_device_callback=self._ble_device_cb,
+                            max_attempts=self.max_retries,
+                        )
 
                     # Attach notifier if needed
                     if not self.has_notifier:
@@ -93,6 +95,8 @@ class DeviceReader:
                         self.has_notifier = True
 
                     while self.encrypted and not self.encryption.is_ready_for_commands:
+                        if not self.client.is_connected:
+                            raise BadConnectionError("Disconnected during handshake")
                         await asyncio.sleep(0.5)
                         _LOGGER.debug("Encryption handshake not finished yet")
 
@@ -316,6 +320,11 @@ class DeviceReader:
                                 # Clear any buffered frames since keys changed/reset
                                 self._enc_buffer.clear()
                                 self._enc_expected_len = None
+                                try:
+                                    await self.client.disconnect()
+                                except Exception:
+                                    pass
+                                self.has_notifier = False
                                 continue
                             await self.client.write_gatt_char(WRITE_UUID, peer_pubkey_response)
                             continue
@@ -329,9 +338,19 @@ class DeviceReader:
                                 # Clear any buffered frames since keys changed/reset
                                 self._enc_buffer.clear()
                                 self._enc_expected_len = None
+                                try:
+                                    await self.client.disconnect()
+                                except Exception:
+                                    pass
+                                self.has_notifier = False
                                 continue
                     except Exception as err:
                         _LOGGER.warning("Error handling decrypted pre-key message: %s", err)
+                        try:
+                            await self.client.disconnect()
+                        except Exception:
+                            pass
+                        self.has_notifier = False
                         continue
 
                 # Treat decrypted bytes as the actual payload and feed into plain handler logic
