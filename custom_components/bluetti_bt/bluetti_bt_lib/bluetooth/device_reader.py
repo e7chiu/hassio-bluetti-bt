@@ -93,7 +93,7 @@ class DeviceReader:
                         self.has_notifier = True
 
                     while self.encrypted and not self.encryption.is_ready_for_commands:
-                        await asyncio.sleep(5)
+                        await asyncio.sleep(0.5)
                         _LOGGER.debug("Encryption handshake not finished yet")
 
                     # Execute polling commands
@@ -157,7 +157,7 @@ class DeviceReader:
                                     _LOGGER.warning("Got a parse exception...")
 
             except TimeoutError as err:
-                _LOGGER.error(f"Polling timed out ({self.polling_timeout}s). Trying again later", exc_info=err)
+                _LOGGER.error("Polling timed out (%ss). Trying again later", self.polling_timeout)
                 return None
             except BleakError as err:
                 _LOGGER.error("Bleak error: %s", err)
@@ -313,6 +313,9 @@ class DeviceReader:
                                 _LOGGER.warning("Peer pubkey handling failed: %s", err)
                                 # Reset encryption to force a fresh handshake
                                 self.encryption.reset()
+                                # Clear any buffered frames since keys changed/reset
+                                self._enc_buffer.clear()
+                                self._enc_expected_len = None
                                 continue
                             await self.client.write_gatt_char(WRITE_UUID, peer_pubkey_response)
                             continue
@@ -323,7 +326,10 @@ class DeviceReader:
                             except Exception as err:
                                 _LOGGER.warning("Key acceptance failed: %s", err)
                                 self.encryption.reset()
-                            continue
+                                # Clear any buffered frames since keys changed/reset
+                                self._enc_buffer.clear()
+                                self._enc_expected_len = None
+                                continue
                     except Exception as err:
                         _LOGGER.warning("Error handling decrypted pre-key message: %s", err)
                         continue
@@ -341,7 +347,9 @@ class DeviceReader:
         """Handle plaintext payload bytes by accumulating and fulfilling the notify future."""
         # Ignore notifications we don't expect
         if self.notify_future is None or self.notify_future.done():
-            _LOGGER.warning("Unexpected notification")
+            # Some devices emit unsolicited notifications between requests.
+            # These are harmless; log at debug to avoid noisy warnings.
+            _LOGGER.debug("Unexpected notification (ignored), bytes=%d", len(data) if data is not None else 0)
             return
 
         # If something went wrong, we might get weird data.

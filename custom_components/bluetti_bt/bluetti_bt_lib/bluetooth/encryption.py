@@ -84,6 +84,32 @@ def verify_and_extract_signed_data(message, signed_data_suffix: bytes | None):
 
     return data
 
+def verify_and_extract_signed_data_flexible(message, suffix_candidates: list[bytes]):
+    """Try verifying with any of the provided suffix candidates.
+
+    Returns the 64-byte data if verification succeeds with any suffix; raises InvalidSignature otherwise.
+    """
+    last_err: Exception | None = None
+    for suffix in suffix_candidates:
+        try:
+            _LOGGER.debug("Trying signature verification with suffix len=%d", len(suffix))
+        except Exception:
+            pass
+        try:
+            data = verify_and_extract_signed_data(message, suffix)
+            _LOGGER.debug("Signature verified using suffix len=%d", len(suffix))
+            return data
+        except InvalidSignature as e:
+            last_err = e
+            continue
+        except Exception as e:
+            # For unexpected validation errors (e.g., size), keep the first error
+            last_err = e
+            break
+    if last_err is None:
+        last_err = InvalidSignature()
+    raise last_err
+
 def pubkey_from_bytes(data):
     encoded_peer_pubkey = bytes.fromhex(SECP_256R1_PUBLIC_PREFIX) + data
     return serialization.load_der_public_key(encoded_peer_pubkey)
@@ -161,7 +187,7 @@ class Message:
         message_checksum = self.checksum
         computed_checksum = hexsum(self.body, len(message_checksum))
         if computed_checksum != message_checksum:
-            _LOGGER.error("Checksum error!")
+            raise ValueError("Checksum mismatch")
         _LOGGER.debug("Checksum OK")
 
 class BluettiEncryption:
@@ -182,6 +208,9 @@ class BluettiEncryption:
     # Received through key exchange
     # The signing key for the key exchange is well-known
     peer_pubkey: bytes | None = None
+    # Keep the original 4-byte seed and its reversed order for flexible verification
+    unsecure_seed: bytes | None = None
+    unsecure_seed_rev: bytes | None = None
 
     @property
     def is_ready_for_commands(self) -> bool:
@@ -234,7 +263,11 @@ class BluettiEncryption:
             _LOGGER.error("Unexpected message length")
             return None
 
-        self.unsecure_aes_iv = hashlib.md5(message.data[::-1].tobytes()).digest()
+        # Preserve the 4-byte seed in both original and reversed order
+        self.unsecure_seed = message.data.tobytes()
+        self.unsecure_seed_rev = message.data[::-1].tobytes()
+
+        self.unsecure_aes_iv = hashlib.md5(self.unsecure_seed_rev).digest()
         static_key = bytes.fromhex(LOCAL_AES_KEY)
         self.unsecure_aes_key = hexxor(self.unsecure_aes_iv, static_key)
 
@@ -246,7 +279,20 @@ class BluettiEncryption:
 
     def msg_peer_pubkey(self, message: Message) -> bytes | None:
         _LOGGER.debug("Received peer pubkey, checking signature")
-        data = verify_and_extract_signed_data(message.data, self.unsecure_aes_iv)
+        # Try verifying against multiple possible suffix encodings to support device variations
+        suffixes: list[bytes] = []
+        if self.unsecure_aes_iv is not None:
+            suffixes.append(self.unsecure_aes_iv)
+            # Some firmwares may sign only part of the IV/seed
+            suffixes.append(self.unsecure_aes_iv[8:12])
+        if self.unsecure_seed is not None:
+            suffixes.append(self.unsecure_seed)
+        if self.unsecure_seed_rev is not None:
+            suffixes.append(self.unsecure_seed_rev)
+        # As a last resort, try without any suffix (some firmwares may omit it)
+        suffixes.append(b"")
+
+        data = verify_and_extract_signed_data_flexible(message.data, suffixes)
         self.peer_pubkey = pubkey_from_bytes(data)
 
         _LOGGER.debug("Generating a local keypair")
@@ -289,3 +335,5 @@ class BluettiEncryption:
         self.secure_aes_key = None
         self.unsecure_aes_key = None
         self.unsecure_aes_iv = None
+        self.unsecure_seed = None
+        self.unsecure_seed_rev = None
