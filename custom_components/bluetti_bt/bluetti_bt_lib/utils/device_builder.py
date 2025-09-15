@@ -17,7 +17,7 @@ from ..devices.ep500p import EP500P
 from ..devices.ep600 import EP600
 from ..devices.ep760 import EP760
 from ..devices.ep800 import EP800
-from ..devices.elite100v2 import Elite100V2
+from ..devices.el100v2 import EL100V2
 from ..devices.elite200v2 import Elite200V2
 
 DEVICE_NAME_RE = re.compile(
@@ -58,7 +58,7 @@ def build_device(address: str, name: str):
     if match[1] == "EP800":
         return EP800(address, match[2])
     if match[1] == "E100V2":
-        return Elite100V2(address, match[2])
+        return EL100V2(address, match[2])
     if match[1] == "E200V2":
         return Elite200V2(address, match[2])
 
