@@ -21,7 +21,7 @@ from ..devices.el100v2 import EL100V2
 from ..devices.elite200v2 import Elite200V2
 
 DEVICE_NAME_RE = re.compile(
-    r"^(AC60|AC70|AC70P|AC180|AC180P|AC200L|AC200M|AC300|AC500|EB3A|EP500|EP500P|EP600|EP760|EP800|E100V2|E200V2)(\d+)$"
+    r"^(AC60|AC70|AC70P|AC180|AC180P|AC200L|AC200M|AC300|AC500|EB3A|EP500|EP500P|EP600|EP760|EP800|EL100V2|E200V2)(\d+)$"
 )
 
 
@@ -57,7 +57,7 @@ def build_device(address: str, name: str):
         return EP760(address, match[2])
     if match[1] == "EP800":
         return EP800(address, match[2])
-    if match[1] == "E100V2":
+    if match[1] == "EL100V2":
         return EL100V2(address, match[2])
     if match[1] == "E200V2":
         return Elite200V2(address, match[2])
