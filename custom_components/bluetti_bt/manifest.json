@@ -15,6 +15,7 @@
         { "local_name": "EP760*" },
         { "local_name": "EP800*" },
         { "local_name": "PBOX*" },
+        { "local_name": "EL100V2*"},
         { "local_name": "Elite 200 V2*"}
     ],
     "codeowners": ["@Patrick762"],
